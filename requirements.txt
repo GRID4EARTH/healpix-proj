@@ -1,0 +1,4 @@
+numpy
+healpix-geo
+pyproj
+matplotlib

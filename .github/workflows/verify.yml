@@ -1,0 +1,25 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check healpix-geo against PROJ +proj=healpix
+        run: python scripts/verify_healpix_proj.py --ellipsoid sphere WGS84 GRS80
+      - name: Smoke-test the figure script (without cartopy)
+        run: python scripts/plot_healpix_map.py --depth 1 -o "$RUNNER_TEMP/map.png"

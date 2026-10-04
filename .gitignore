@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
+.pixi/
+
+# local tooling / archives
+.claude/
+files.zip
+CLAUDE_CODE_PROMPT.md
