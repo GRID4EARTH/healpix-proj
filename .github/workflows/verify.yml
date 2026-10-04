@@ -20,10 +20,14 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Check healpix-geo against PROJ +proj=healpix
-        run: python scripts/verify_healpix_proj.py --ellipsoid sphere WGS84 GRS80
+        run: python scripts/verify_healpix_proj.py --ellipsoid unitsphere sphere WGS84 GRS80
       - name: Smoke-test the figure script (without cartopy)
         run: python scripts/plot_healpix_map.py --depth 1 -o "$RUNNER_TEMP/map.png"
       - name: Smoke-test the cartopy example
         run: |
           pip install cartopy pykdtree
           python scripts/plot_healpix_cartopy.py --depth 2 -o "$RUNNER_TEMP/cartopy.png"
+      - name: Write, check and plot a HEALPix GeoTIFF
+        run: |
+          pip install rasterio
+          python scripts/healpix_geotiff.py --depth 4 --tiff "$RUNNER_TEMP/hp.tif" -o "$RUNNER_TEMP/geotiff.png"

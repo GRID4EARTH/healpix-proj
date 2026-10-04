@@ -43,7 +43,7 @@ Python 3.10 or later.
 python3 -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-pip install cartopy pykdtree   # optional: coastlines on the figure, and the cartopy example
+pip install cartopy pykdtree rasterio   # optional: figures, the cartopy and GeoTIFF examples
 ```
 
 ## Usage
@@ -54,7 +54,7 @@ python scripts/verify_healpix_proj.py
 
 # Choose the ellipsoid(s)
 python scripts/verify_healpix_proj.py --ellipsoid WGS84
-python scripts/verify_healpix_proj.py --ellipsoid sphere WGS84 GRS80
+python scripts/verify_healpix_proj.py --ellipsoid unitsphere sphere WGS84 GRS80
 
 # Choose the depths (resolutions)
 python scripts/verify_healpix_proj.py --ellipsoid WGS84 --depths 1 2 3 4 5 6
@@ -64,6 +64,9 @@ python scripts/verify_healpix_proj.py --lon-0 90
 
 # Regenerate the figure (coastlines are drawn only if cartopy is installed)
 python scripts/plot_healpix_map.py --depth 1   # -> docs/images/healpix_wgs84_depth1.png
+
+# GeoTIFF example: write, check and plot (needs rasterio, cartopy and pykdtree or scipy)
+python scripts/healpix_geotiff.py --depth 4 --tiff healpix_wgs84.tif   # -> docs/images/healpix_geotiff.png
 
 # Cartopy example (needs cartopy and pykdtree or scipy)
 python scripts/plot_healpix_cartopy.py --depth 2   # -> docs/images/healpix_cartopy.png
@@ -102,6 +105,33 @@ healpix-geo cells are drawn from coordinates that are already projected
 (with the seam handling described below), not re-projected by cartopy, so
 they are never cut at the facet seams.
 
+## Writing healpix-geo data to a GeoTIFF
+
+![GeoTIFF on the HEALPix grid, a zoom showing pixels = cells, and GDAL's reprojection](docs/images/healpix_geotiff.png)
+
+`scripts/healpix_geotiff.py` writes a value per healpix-geo cell (here the
+WGS84 geodesic distance from Brest) to a GeoTIFF, reads it back and plots it.
+
+- **One pixel = one cell.** On the HEALPix plane every cell is a square rotated
+  by 45°, so the raster uses a rotated affine transform (stored as
+  `ModelTransformationTag`) with pixel centres on cell centres. At depth 4 the
+  96 × 96 raster holds all 3072 cells, the pixel centres are within 2·10⁻¹⁴
+  pixel of the cell centres, and panel (b) shows the pixels coinciding with the
+  cells drawn by healpix-geo. Pixels in the gaps between polar triangles are
+  nodata; cells cut by the map edge appear at both edges (16 pixels).
+- **The CRS lives in a side-car file.** GeoTIFF has no GeoKeys for the HEALPix
+  projection, so GDAL keeps the CRS in `<name>.tif.aux.xml`; without it the
+  .tif has no CRS. The script therefore also stores the CRS (WKT), the depth,
+  the ellipsoid and the indexing scheme in the TIFF metadata
+  (`healpix_crs_wkt`, `healpix_depth`, ...), and `healpix_crs()` restores the
+  CRS from there.
+- **GDAL can reproject it, with one option.** Across the projection's cuts
+  GDAL underestimates the source window it needs and leaves wedge-shaped holes.
+  With the warp option `SOURCE_EXTRA` set to the raster size
+  (`gdalwarp -wo SOURCE_EXTRA=96 ...`) every pixel of the EPSG:4326 output gets
+  the value of the cell containing it (checked for all pixels of a 0.5° grid),
+  panel (c).
+
 ## What is checked
 
 1. **Shape test**: the 4 vertices of *every* cell at each depth are projected
@@ -118,7 +148,7 @@ they are never cut at the facet seams.
 
 - **Every cell matches between healpix-geo and PROJ**, with no exceptions:
   all 12·4^depth cells for depth 1–4, in the equatorial and polar zones alike,
-  for the sphere, WGS84 and GRS80 (max shape error ~5·10⁻⁸, round-trip error
+  for the unit sphere, healpix-geo's `sphere` (R = 6370997 m), WGS84 and GRS80 (max shape error ~5·10⁻⁸, round-trip error
   ~10⁻¹³ degrees).
 - **All edge neighbours share their edge**, and the only pairs that do not are
   exactly those across a polar cut, as the projection requires.
@@ -141,8 +171,10 @@ they are never cut at the facet seams.
   pixel per cell needs an affine transform with a rotation term
   (e.g. ModelTransformationTag), and the origin and resolution must be aligned
   to the depth explicitly.
-- **No EPSG code**: the CRS is embedded as a PROJ string / custom WKT, so
-  portability outside PROJ-based software (the GDAL family) is limited.
+- **No EPSG code and no GeoKeys**: the CRS is a custom WKT that GDAL keeps in a
+  `.aux.xml` side-car; store it in the TIFF metadata as well (see above).
+  Portability outside PROJ-based software (the GDAL family) is limited.
+- **Reprojecting with GDAL** needs the warp option `SOURCE_EXTRA` (see above).
 
 ### Seams and `lon_0`
 
@@ -172,7 +204,8 @@ crosses a seam, split the data at the seam instead.
 ├── scripts/
 │   ├── verify_healpix_proj.py   # the consistency checks
 │   ├── plot_healpix_map.py      # generates the cell-ID figures
-│   └── plot_healpix_cartopy.py  # cartopy CRS for +proj=healpix, and its figure
+│   ├── plot_healpix_cartopy.py  # cartopy CRS for +proj=healpix, and its figure
+│   └── healpix_geotiff.py       # write, check and plot a HEALPix GeoTIFF
 ├── docs/
 │   ├── investigation.md         # background and detailed findings
 │   └── images/                  # figures used in this README

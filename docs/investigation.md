@@ -118,11 +118,18 @@ tests were run (`scripts/verify_healpix_proj.py`):
    geotransform does not work.
 4. **Resolution and origin must be aligned to the nside (depth)
    subdivision** explicitly; this does not happen automatically.
-5. **No EPSG code:** the CRS has to be embedded as a PROJ string / custom
-   WKT, so portability outside PROJ-based software (the GDAL family) is
+5. **No EPSG code and no GeoKeys:** the CRS has to be a custom WKT. GDAL
+   keeps it in a `.aux.xml` side-car file, so a .tif copied on its own has no
+   CRS. `scripts/healpix_geotiff.py` also stores the WKT (with the depth,
+   ellipsoid and indexing scheme) in the TIFF metadata and restores it from
+   there. Portability outside PROJ-based software (the GDAL family) is
    limited.
 6. **Regions crossing a facet seam:** because the projection is interrupted,
    naive interpolation or resampling across a seam gives wrong results.
    Changing `lon_0` cannot remove the seams (see point 2); it only chooses
    which equatorial base cell is split by the map edge. Split the data at
    the seam instead.
+7. **Reprojecting with GDAL:** GDAL estimates the source window for each
+   output chunk; across the cuts that estimate is too small and leaves
+   wedge-shaped holes. The warp option `SOURCE_EXTRA` set to the raster size
+   fixes it; every output pixel then gets the value of the cell containing it.

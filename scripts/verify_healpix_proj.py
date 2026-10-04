@@ -20,7 +20,7 @@ Checks
    pairs whose shared edge is one of the projection's cuts.
 3. [Round-trip test] Check that forward then inverse projection returns the
    original lon/lat (consistency of PROJ's forward/inverse).
-4. Run for both the sphere and an ellipsoid (WGS84) and compare.
+4. Run for spheres and ellipsoids (e.g. sphere, WGS84) and compare.
 
 Seams
 -----
@@ -53,6 +53,7 @@ import numpy as np
 
 try:
     import healpix_geo.nested as hpg
+    from healpix_geo import ellipsoid as hg_ellipsoid
 except ImportError as exc:  # pragma: no cover
     sys.exit(
         "healpix-geo not found; run `pip install healpix-geo`."
@@ -88,15 +89,18 @@ def zone_of(depth: int, ipix: np.ndarray) -> np.ndarray:
 
 
 def proj_string(ellipsoid: str, lon_0: float = 0.0) -> str:
-    """Build the PROJ string for an ellipsoid name.
+    """Build the PROJ string for a healpix-geo ellipsoid name.
 
-    healpix-geo's ellipsoid="sphere" is the unit sphere, so it maps to a
-    PROJ sphere of radius 1 (+R=1). Ellipsoid names such as "WGS84" are
-    passed through to +ellps=.
+    The shape comes from healpix-geo itself (`ellipsoid.resolve`), so both
+    libraries use exactly the same parameters. Note that healpix-geo's
+    "sphere" has a radius of 6370997 m; the unit sphere is "unitsphere".
     """
-    if ellipsoid.lower() == "sphere":
-        return f"+proj=healpix +R=1 +lon_0={lon_0}"
-    return f"+proj=healpix +ellps={ellipsoid} +lon_0={lon_0}"
+    params = hg_ellipsoid.resolve(ellipsoid)
+    if "radius" in params:
+        shape = f"+R={params['radius']}"
+    else:
+        shape = f"+a={params['semimajor_axis']} +rf={params['inverse_flattening']}"
+    return f"+proj=healpix {shape} +lon_0={lon_0}"
 
 
 @dataclass
@@ -351,7 +355,7 @@ def main() -> None:
         nargs="+",
         default=["sphere", "WGS84"],
         help="ellipsoid(s) to check, using names accepted by healpix-geo "
-        "(e.g. sphere, WGS84, GRS80). Default: sphere WGS84",
+        "(e.g. unitsphere, sphere, WGS84, GRS80). Default: sphere WGS84",
     )
     parser.add_argument(
         "--depths",
