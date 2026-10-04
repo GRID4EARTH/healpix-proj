@@ -43,7 +43,7 @@ Python 3.10 or later.
 python3 -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-pip install cartopy        # optional: only used to draw coastlines on the figure
+pip install cartopy pykdtree   # optional: coastlines on the figure, and the cartopy example
 ```
 
 ## Usage
@@ -64,11 +64,43 @@ python scripts/verify_healpix_proj.py --lon-0 90
 
 # Regenerate the figure (coastlines are drawn only if cartopy is installed)
 python scripts/plot_healpix_map.py --depth 1   # -> docs/images/healpix_wgs84_depth1.png
+
+# Cartopy example (needs cartopy and pykdtree or scipy)
+python scripts/plot_healpix_cartopy.py --depth 2   # -> docs/images/healpix_cartopy.png
 ```
 
 `verify_healpix_proj.py` exits with `0` if every check passes and `1` if an
 inconsistency is found. CI runs it on every push
 ([.github/workflows/verify.yml](.github/workflows/verify.yml)).
+
+## Using the projection in cartopy
+
+![cartopy GeoAxes in +proj=healpix with healpix-geo cells](docs/images/healpix_cartopy.png)
+
+`ccrs.Projection([("proj", "healpix")])` on its own raises `NotImplementedError`,
+because cartopy also needs the map domain. `scripts/plot_healpix_cartopy.py`
+defines a `HEALPix` CRS that supplies it (the equatorial band plus the polar
+triangles), so the usual cartopy tools work: `stock_img`, `coastlines`,
+`add_feature`, gridlines, and any data passed with
+`transform=ccrs.PlateCarree()` (the red points above).
+
+```python
+import sys; sys.path.insert(0, "scripts")
+import cartopy.crs as ccrs
+import matplotlib.pyplot as plt
+from plot_healpix_cartopy import HEALPix, add_healpix_cells
+
+crs = HEALPix()                      # +proj=healpix +ellps=WGS84 +lon_0=0
+ax = plt.axes(projection=crs)
+ax.set_global()
+ax.stock_img()
+ax.coastlines()
+add_healpix_cells(ax, crs, depth=2, facecolor="none", edgecolor="k", linewidth=0.4)
+```
+
+healpix-geo cells are drawn from coordinates that are already projected
+(with the seam handling described below), not re-projected by cartopy, so
+they are never cut at the facet seams.
 
 ## What is checked
 
@@ -139,7 +171,8 @@ crosses a seam, split the data at the seam instead.
 ├── requirements.txt
 ├── scripts/
 │   ├── verify_healpix_proj.py   # the consistency checks
-│   └── plot_healpix_map.py      # generates the figures
+│   ├── plot_healpix_map.py      # generates the cell-ID figures
+│   └── plot_healpix_cartopy.py  # cartopy CRS for +proj=healpix, and its figure
 ├── docs/
 │   ├── investigation.md         # background and detailed findings
 │   └── images/                  # figures used in this README

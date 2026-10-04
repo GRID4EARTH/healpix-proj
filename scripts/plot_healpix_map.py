@@ -26,16 +26,16 @@ import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon
-from pyproj import Transformer
 
-import healpix_geo.nested as hpg
+from verify_healpix_proj import Projection
 
 ELLIPSOID = "WGS84"
-PROJ_HEALPIX = f"+proj=healpix +ellps={ELLIPSOID} +lon_0=0"
-
-# A vertex lying exactly on a facet boundary (pole, boundary meridian, map
-# edge) has no unique projected position, so nudge it towards the cell centre.
-NUDGE = 1e-7
+# Vertices are nudged towards their cell centre before projection; see
+# `Projection.cells` in verify_healpix_proj.py. Cell edges are straight lines
+# on the HEALPix plane, so the 4 vertices are enough.
+PROJ = Projection(ELLIPSOID, 0.0)
+HALF_WIDTH = PROJ.half_width
+TO_PROJ = PROJ.fwd
 
 BASE_COLORS = [
     "#cfe3f5", "#d9ecd0", "#f7dccb", "#e6d9f2",  # north polar 0-3
@@ -43,28 +43,11 @@ BASE_COLORS = [
     "#d6dcf3", "#efe0c9", "#d0e8d8", "#f1d5ea",  # south polar 8-11
 ]
 
-TO_PROJ = Transformer.from_crs("EPSG:4326", PROJ_HEALPIX, always_xy=True)
-# x spans [-πR, πR] (R: authalic radius)
-HALF_WIDTH = TO_PROJ.transform(180.0, 0.0)[0]
 
-
-def cell_polygons(depth: int, step: int = 16):
+def cell_polygons(depth: int):
     """Return each cell's boundary and centre in projected coordinates."""
     ipix = np.arange(12 * 4**depth, dtype=np.uint64)
-    lon, lat = hpg.vertices(ipix, depth, ellipsoid=ELLIPSOID, step=step)
-    clon, clat = hpg.healpix_to_lonlat(ipix, depth, ellipsoid=ELLIPSOID)
-
-    # unwrap longitudes around the cell centre, then nudge towards it
-    lon = clon[:, None] + (lon - clon[:, None] + 180.0) % 360.0 - 180.0
-    lon = lon + (clon[:, None] - lon) * NUDGE
-    lat = lat + (clat[:, None] - lat) * NUDGE
-
-    x, y = TO_PROJ.transform(lon, lat)
-    cx, cy = TO_PROJ.transform(clon, clat)
-
-    # keep cells crossing the map edge on the same side as their centre
-    x = x - 2 * HALF_WIDTH * np.round((x - cx[:, None]) / (2 * HALF_WIDTH))
-    return ipix, x, y, cx, cy
+    return (ipix, *PROJ.cells(ipix, depth))
 
 
 def add_cells(ax, depth: int, **style):
