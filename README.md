@@ -33,7 +33,9 @@ it. Two ways around this were considered:
   exactly, standard HEALPix can be used as a GeoTIFF CRS directly.
 
 This repository tests the second option. The full investigation is in
-[docs/investigation.md](docs/investigation.md).
+[docs/investigation.md](docs/investigation.md). How the CRS could be
+standardised (EPSG registration, GeoTIFF) is discussed in
+[docs/standardisation.md](docs/standardisation.md).
 
 ## Setup
 
