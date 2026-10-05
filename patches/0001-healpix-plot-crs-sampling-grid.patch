@@ -1,0 +1,1665 @@
+From f256dadf24c046d31c14ae019b96b7df0ced775d Mon Sep 17 00:00:00 2001
+From: Tina Odaka <tina.odaka@ifremer.fr>
+Date: Mon, 5 Oct 2026 02:18:48 +0200
+Subject: [PATCH] Add CRS-aware AffineSamplingGrid, the lossless +proj=healpix
+ grid and GeoTIFF helpers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AffineSamplingGrid now follows the rasterio / GDAL conventions (the
+transform maps pixel corners, the shape is (height, width)) and takes an
+optional `crs`. Pixel centres of a projected grid are inverse-projected
+before the cell lookup; pixels outside the projection's domain, and the
+duplicate side of a seam, are masked instead of being passed to
+healpix-geo (which panics on non-finite latitudes).
+
+New:
+- `healpix_plot.projection`: PROJ strings / pyproj CRSs for the ellipsoidal
+  HEALPix projection built from healpix-geo's own ellipsoid parameters, and
+  `cell_aligned_grid` (`AffineSamplingGrid.from_healpix`): the 45°-rotated
+  grid in `+proj=healpix` with exactly one pixel per cell, so resampling
+  onto it is lossless (level >= 1, lon_0 a multiple of 90°).
+- `AffineSamplingGrid.from_raster`: the grid of a rasterio dataset or a
+  rioxarray DataArray; `pixel_indices`: the pixel of each cell centre.
+- `ConcreteSamplingGrid.lon / lat / valid / cell_ids / corners`.
+- `healpix_plot.raster.to_dataarray`: a georeferenced xarray.DataArray
+  (CRS + transform via rioxarray when available) ready for `.rio.to_raster`;
+  `raster_cell_ids`: the cell id under every pixel of an existing raster.
+- `healpix_plot.HEALPix`: a cartopy projection for `+proj=healpix` with the
+  map outline, usable as `plot(..., projection="HEALPix")`.
+- `plot` draws rotated grids with `pcolormesh` and projected grids in their
+  own CRS.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/api.rst                             |  17 ++
+ docs/tutorials/quickstart.md             |   2 +-
+ docs/user-guide/sampling-grid.md         |  56 +++-
+ healpix_plot/__init__.py                 |  14 +-
+ healpix_plot/plotting.py                 | 153 +++++++++--
+ healpix_plot/projection.py               | 161 ++++++++++++
+ healpix_plot/raster.py                   | 123 +++++++++
+ healpix_plot/resampling.py               |  17 +-
+ healpix_plot/sampling_grid.py            | 316 ++++++++++++++++++++---
+ healpix_plot/tests/test_plotting.py      | 109 ++++++++
+ healpix_plot/tests/test_projection.py    | 174 +++++++++++++
+ healpix_plot/tests/test_raster.py        | 101 ++++++++
+ healpix_plot/tests/test_sampling_grid.py | 133 +++++++++-
+ 13 files changed, 1303 insertions(+), 73 deletions(-)
+ create mode 100644 healpix_plot/projection.py
+ create mode 100644 healpix_plot/raster.py
+ create mode 100644 healpix_plot/tests/test_plotting.py
+ create mode 100644 healpix_plot/tests/test_projection.py
+ create mode 100644 healpix_plot/tests/test_raster.py
+
+diff --git a/docs/api.rst b/docs/api.rst
+index 6b1f9fe..20fc8fc 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -26,6 +26,23 @@ Classes
+    :toctree: generated
+ 
+    healpix_plot.HealpixGrid
++   healpix_plot.HEALPix
+    healpix_plot.sampling_grid.ParametrizedSamplingGrid
+    healpix_plot.sampling_grid.AffineSamplingGrid
+    healpix_plot.sampling_grid.ConcreteSamplingGrid
++
++Projection and rasters
++----------------------
++
++Helpers for PROJ's ellipsoidal HEALPix projection, and for exchanging
++resampled images with georeferenced rasters (GeoTIFF via rioxarray).
++
++.. autosummary::
++   :toctree: generated
++
++   healpix_plot.projection.proj_string
++   healpix_plot.projection.healpix_crs
++   healpix_plot.projection.geographic_crs
++   healpix_plot.projection.cell_aligned_grid
++   healpix_plot.raster.to_dataarray
++   healpix_plot.raster.raster_cell_ids
+diff --git a/docs/tutorials/quickstart.md b/docs/tutorials/quickstart.md
+index 68e6edf..06bb307 100644
+--- a/docs/tutorials/quickstart.md
++++ b/docs/tutorials/quickstart.md
+@@ -112,7 +112,7 @@ ax.gridlines(draw_labels="y")
+ 
+ ## 3 — `AffineSamplingGrid.from_transform` — pixel-aligned grid
+ 
+-Use `AffineSamplingGrid` when the output pixels must align exactly with a reference raster (e.g. a GeoTIFF). The affine transform maps pixel indices to geographic coordinates: `Affine(pixel_width, 0, lon_min, 0, -pixel_height, lat_max)`.
++Use `AffineSamplingGrid` when the output pixels must align exactly with a reference raster (e.g. a GeoTIFF). The affine transform maps pixel indices to the coordinates of the pixel's outer corner, as in rasterio / GDAL: `Affine(pixel_width, 0, lon_min, 0, -pixel_height, lat_max)`; the shape is `(height, width)`. Pass `crs=` to sample in a projected coordinate system, or use `AffineSamplingGrid.from_raster()` to take the grid of an existing raster (see {doc}`../user-guide/sampling-grid`).
+ 
+ Here we define a 0.01°/pixel grid (~1 km) over Corsica.
+ 
+diff --git a/docs/user-guide/sampling-grid.md b/docs/user-guide/sampling-grid.md
+index 5624f14..2c4165e 100644
+--- a/docs/user-guide/sampling-grid.md
++++ b/docs/user-guide/sampling-grid.md
+@@ -37,16 +37,66 @@ This is the right choice when comparing multiple datasets or animating over time
+ 
+ ## 3. Affine transform (`AffineSamplingGrid`)
+ 
+-Use `AffineSamplingGrid` when the output pixels must align with a reference raster (e.g. a GeoTIFF):
++Use `AffineSamplingGrid` when the output pixels must align with a reference raster (e.g. a GeoTIFF). It follows the rasterio / GDAL conventions: the transform maps pixel indices `(col, row)` to the coordinates of the *outer corner* of the pixel, and the shape is `(height, width)`:
+ 
+ ```python
+ from healpix_plot.sampling_grid import AffineSamplingGrid
+ from affine import Affine
+ 
+-transform = Affine(0.01, 0, 5, 0, -0.01, 45)  # 0.01 deg/pixel, top-left at (-10, 60)
+-sampling_grid = AffineSamplingGrid.from_transform(transform, shape=(4000, 2500))
++transform = Affine(0.01, 0, 5, 0, -0.01, 45)  # 0.01 deg/pixel, top-left corner at (5, 45)
++sampling_grid = AffineSamplingGrid.from_transform(transform, shape=(2500, 4000))
+ ```
+ 
++Without a `crs`, the coordinates are longitude / latitude in degrees. Pass `crs` (anything `pyproj.CRS.from_user_input` accepts) to sample in a projected coordinate system; the pixel centres are then projected back to longitude / latitude before looking up the cells, and pixels outside the projection's domain stay at the background value:
++
++```python
++sampling_grid = AffineSamplingGrid.from_transform(
++    Affine(10_000, 0, -2_000_000, 0, -10_000, 6_000_000),
++    shape=(400, 400),
++    crs="EPSG:3857",
++)
++```
++
++The grid of an existing raster can be taken directly from an open rasterio dataset or a rioxarray-enabled `DataArray`:
++
++```python
++import rasterio
++
++with rasterio.open("reference.tif") as src:
++    sampling_grid = AffineSamplingGrid.from_raster(src)
++```
++
++### The lossless grid: one pixel per cell
++
++In PROJ's ellipsoidal HEALPix projection (`+proj=healpix`, the same construction as healpix-geo's ellipsoidal cells) every cell of a given level is a square rotated by 45°. `AffineSamplingGrid.from_healpix` builds the rotated grid on which each pixel *is* a cell, so resampling onto it loses nothing and the result can be written to a GeoTIFF and read back cell by cell:
++
++```python
++import healpix_plot
++from healpix_plot.raster import to_dataarray, raster_cell_ids
++
++healpix_grid = healpix_plot.HealpixGrid(level=6, indexing_scheme="nested", ellipsoid="WGS84")
++sampling_grid = AffineSamplingGrid.from_healpix(healpix_grid)        # the whole globe
++# sampling_grid = AffineSamplingGrid.from_healpix(healpix_grid, cell_ids)  # cropped to the data
++
++target, image = healpix_plot.resample(
++    cell_ids, data, sampling_grid=sampling_grid, healpix_grid=healpix_grid,
++    interpolation="nearest", agg="first",
++)
++raster = to_dataarray(image, target, healpix_grid)   # georeferenced xarray.DataArray
++raster.rio.to_raster("healpix.tif")                   # needs rioxarray
++
++with rasterio.open("healpix.tif") as src:
++    cell_ids_per_pixel = raster_cell_ids(src, healpix_grid)   # masked off the globe
++```
++
++Things to know about this grid:
++
++- The pixels are rotated, so the raster is drawn with `pcolormesh` rather than `imshow`; `plot(..., projection="HEALPix")` shows it undistorted.
++- The CRS has no EPSG code and no GeoTIFF GeoKeys, so GDAL keeps it in a `<file>.tif.aux.xml` side-car. `to_dataarray` also writes it as WKT into the TIFF tags (`healpix_crs_wkt`, with `healpix_depth`, `healpix_indexing_scheme` and `healpix_ellipsoid`), and `from_raster` / `raster_cell_ids` fall back to that tag when the side-car is missing. Software outside the GDAL/PROJ family may read neither.
++- `+lon_0` must be a multiple of 90° and `level` at least 1. The full grid is `6 * nside` pixels on each side, of which a third lie on the globe; pass `cell_ids` to crop it.
++- Only `"nested"` and `"ring"` (single-level) grids are supported.
++- Interpolating or resampling *across* facet seams in this projection is wrong, as the projection is interrupted there.
++
+ :::{seealso}
+ See {doc}`../tutorials/quickstart` for more information
+ :::
+diff --git a/healpix_plot/__init__.py b/healpix_plot/__init__.py
+index 755bfe1..1b7b372 100644
+--- a/healpix_plot/__init__.py
++++ b/healpix_plot/__init__.py
+@@ -7,8 +7,16 @@ except Exception:  # pragma: no cover
+ 
+ from healpix_plot.ellipsoid import EllipsoidLike
+ from healpix_plot.healpix import HealpixGrid
+-from healpix_plot.plotting import plot
++from healpix_plot.plotting import HEALPix, plot
+ from healpix_plot.resampling import resample
+-from healpix_plot.sampling_grid import SamplingGrid
++from healpix_plot.sampling_grid import AffineSamplingGrid, SamplingGrid
+ 
+-__all__ = ["HealpixGrid", "plot", "resample", "SamplingGrid", "EllipsoidLike"]
++__all__ = [
++    "HealpixGrid",
++    "HEALPix",
++    "plot",
++    "resample",
++    "SamplingGrid",
++    "AffineSamplingGrid",
++    "EllipsoidLike",
++]
+diff --git a/healpix_plot/plotting.py b/healpix_plot/plotting.py
+index fe51b21..8659941 100644
+--- a/healpix_plot/plotting.py
++++ b/healpix_plot/plotting.py
+@@ -5,9 +5,11 @@ from typing import TYPE_CHECKING
+ import cartopy.crs as ccrs
+ import matplotlib.pyplot as plt
+ import numpy as np
++import shapely.geometry as sgeom
+ 
+ from healpix_plot.healpix import HealpixGrid
+-from healpix_plot.resampling import resample
++from healpix_plot.projection import resolve_ellipsoid
++from healpix_plot.resampling import is_rgb, resample
+ from healpix_plot.sampling_grid import ParametrizedSamplingGrid
+ 
+ if TYPE_CHECKING:
+@@ -21,6 +23,91 @@ if TYPE_CHECKING:
+     from healpix_plot.sampling_grid import SamplingGrid, SamplingGridParameters
+ 
+ 
++class HEALPix(ccrs.Projection):
++    """Cartopy projection for PROJ's ellipsoidal HEALPix (``+proj=healpix``).
++
++    Cartopy needs the outline of the map in addition to the PROJ definition;
++    this class supplies it (the equatorial band plus the four polar triangles
++    at each pole), so coastlines, features, gridlines and data passed with
++    ``transform=ccrs.PlateCarree()`` all work.
++
++    Parameters
++    ----------
++    central_longitude : float, default: 0.0
++        The central meridian (``lon_0``). Only multiples of 90° line up with
++        the HEALPix cells.
++    ellipsoid : ellipsoid-like, default: "sphere"
++        The reference ellipsoid, resolved like ``HealpixGrid.ellipsoid``. Pass
++        the same ellipsoid as the data for the cells to be squares.
++    """
++
++    def __init__(self, central_longitude: float = 0.0, ellipsoid: Any = "sphere"):
++        params = resolve_ellipsoid(ellipsoid)
++        if "radius" in params:
++            globe = ccrs.Globe(
++                ellipse=None,
++                semimajor_axis=params["radius"],
++                semiminor_axis=params["radius"],
++            )
++        else:
++            globe = ccrs.Globe(
++                ellipse=None,
++                semimajor_axis=params["semimajor_axis"],
++                inverse_flattening=params["inverse_flattening"],
++            )
++        super().__init__(
++            [("proj", "healpix"), ("lon_0", central_longitude)], globe=globe
++        )
++
++        # x spans [-πR, πR] (R: authalic radius); x(lon_0 + 90°) = πR / 2
++        w = (
++            2.0
++            * self.transform_point(central_longitude + 90.0, 0.0, self.as_geodetic())[0]
++        )
++        q = w / 4.0
++        self._half_width = w
++
++        # outline, counter-clockwise from the bottom-left corner: the equatorial
++        # band |y| <= w/4 plus a triangle of height w/4 over each polar facet
++        xs = np.linspace(-w, w, 9)
++        top = [(x, q if i % 2 == 0 else 2 * q) for i, x in enumerate(xs)]
++        bottom = [(x, -q if i % 2 == 0 else -2 * q) for i, x in enumerate(xs)]
++        self._boundary = sgeom.LinearRing(bottom + top[::-1])
++        self._threshold = w / 1e4
++
++    @property
++    def boundary(self):
++        return self._boundary
++
++    @property
++    def x_limits(self):
++        return (-self._half_width, self._half_width)
++
++    @property
++    def y_limits(self):
++        return (-self._half_width / 2, self._half_width / 2)
++
++    @property
++    def threshold(self):
++        return self._threshold
++
++
++def _data_crs(target_grid, ax=None) -> ccrs.CRS:
++    """the cartopy CRS of the resampled image
++
++    Cartopy only draws images and meshes from a `Projection` (not a bare
++    `CRS`). When the axes already use the same projection, that instance is
++    returned so that cartopy does not re-project the data at all.
++    """
++    if target_grid.is_geographic:
++        return ccrs.PlateCarree()
++
++    projection = ccrs.Projection(target_grid.crs)
++    if ax is not None and getattr(ax, "projection", None) == projection:
++        return ax.projection
++    return projection
++
++
+ def plot(
+     cell_ids: np.ndarray,
+     data: np.ndarray,
+@@ -57,7 +144,9 @@ def plot(
+     sampling_grid : SamplingGrid or dict of str to any
+         The target grid.
+     projection : str or cartopy.crs.CRS
+-        The projection used to construct a new axis. Ignored if ``ax`` is given.
++        The projection used to construct a new axis. Ignored if ``ax`` is
++        given. The name of a cartopy projection, or ``"HEALPix"`` for
++        :py:class:`HEALPix` on the data's ellipsoid.
+     view : tuple of float, optional
+         If given, defines the extent of the displayed plot.
+     agg : str, default: "mean"
+@@ -139,10 +228,13 @@ def plot(
+         background_value=background_value,
+     )
+     if isinstance(projection, str):
+-        _projection = getattr(ccrs, projection, None)
+-        if _projection is None:
+-            raise ValueError(f"unknown projection: {projection}")
+-        projection = _projection()
++        if projection.lower() == "healpix":
++            projection = HEALPix(ellipsoid=healpix_grid.ellipsoid)
++        else:
++            _projection = getattr(ccrs, projection, None)
++            if _projection is None:
++                raise ValueError(f"unknown projection: {projection}")
++            projection = _projection()
+ 
+     if ax is None:
+         fig, ax = plt.subplots(
+@@ -150,6 +242,7 @@ def plot(
+             subplot_kw={"projection": projection},
+             layout="constrained",
+         )
++    data_crs = _data_crs(target_grid, ax)
+ 
+     if cell_ids.size == 12 * 4**healpix_grid.level:
+         ax.set_global()
+@@ -158,20 +251,40 @@ def plot(
+     else:
+         # set extent before plotting for a smoother image
+         # See https://github.com/SciTools/cartopy/issues/1468
+-        ax.set_extent(target_grid.extent, crs=ccrs.PlateCarree())
+-
+-    mappable = ax.imshow(
+-        image,
+-        extent=target_grid.extent,
+-        origin="lower",
+-        interpolation="nearest",
+-        aspect="auto",
+-        vmin=vmin,
+-        vmax=vmax,
+-        norm=norm,
+-        cmap=cmap,
+-        transform=ccrs.PlateCarree(),
+-    )
++        ax.set_extent(target_grid.extent, crs=data_crs)
++
++    if target_grid.is_axis_aligned:
++        mappable = ax.imshow(
++            image,
++            extent=target_grid.extent,
++            origin=target_grid.origin,
++            interpolation="nearest",
++            aspect="auto",
++            vmin=vmin,
++            vmax=vmax,
++            norm=norm,
++            cmap=cmap,
++            transform=data_crs,
++        )
++    else:
++        # rotated pixels (e.g. the cell-aligned grid in `+proj=healpix`)
++        # cannot be drawn with `imshow`
++        if is_rgb(image):
++            raise NotImplementedError(
++                "RGB(A) images on rotated sampling grids are not supported"
++            )
++        corner_x, corner_y = target_grid.corners()
++        mappable = ax.pcolormesh(
++            corner_x,
++            corner_y,
++            image,
++            shading="flat",
++            vmin=vmin,
++            vmax=vmax,
++            norm=norm,
++            cmap=cmap,
++            transform=data_crs,
++        )
+     if title is not None:
+         ax.set_title(title)
+ 
+diff --git a/healpix_plot/projection.py b/healpix_plot/projection.py
+new file mode 100644
+index 0000000..f41152d
+--- /dev/null
++++ b/healpix_plot/projection.py
+@@ -0,0 +1,161 @@
++"""PROJ helpers for the ellipsoidal HEALPix projection (``+proj=healpix``).
++
++PROJ's ``healpix`` projection composes the authalic-latitude conversion with
++the spherical HPX projection, which is exactly how ``healpix-geo`` defines
++ellipsoidal HEALPix cells. In that plane every cell of a given level is a
++square rotated by 45°, so a raster with one pixel per cell can be described by
++an affine transform, and written to a GeoTIFF without loss.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++from affine import Affine
++
++if TYPE_CHECKING:
++    import pyproj
++
++    from healpix_plot.healpix import HealpixGrid
++    from healpix_plot.sampling_grid import AffineSamplingGrid
++
++
++def resolve_ellipsoid(ellipsoid: Any) -> dict[str, Any]:
++    """Normalize an ellipsoid-like object to a healpix-geo style dict.
++
++    Accepts a name known to ``healpix_geo.ellipsoid.resolve`` (``"sphere"``,
++    ``"WGS84"``, ...), a dict with ``radius`` or ``semimajor_axis`` /
++    ``inverse_flattening``, an object with those attributes, an object with an
++    ``ellipsoid`` attribute (``HealpixGrid`` or ``xdggs.HealpixInfo``), or
++    ``None`` (the sphere).
++    """
++    import healpix_geo.ellipsoid
++
++    if ellipsoid is None:
++        ellipsoid = "sphere"
++    if hasattr(ellipsoid, "ellipsoid") and not isinstance(ellipsoid, dict):
++        ellipsoid = ellipsoid.ellipsoid
++        if ellipsoid is None:
++            ellipsoid = "sphere"
++    if isinstance(ellipsoid, str):
++        return dict(healpix_geo.ellipsoid.resolve(ellipsoid))
++    if isinstance(ellipsoid, dict):
++        return dict(ellipsoid)
++    if hasattr(ellipsoid, "radius"):
++        return {"radius": float(ellipsoid.radius)}
++    return {
++        "semimajor_axis": float(ellipsoid.semimajor_axis),
++        "inverse_flattening": float(ellipsoid.inverse_flattening),
++    }
++
++
++def _shape_params(ellipsoid: Any) -> str:
++    params = resolve_ellipsoid(ellipsoid)
++    if "radius" in params:
++        return f"+R={params['radius']!r}"
++    if "semiminor_axis" in params and "inverse_flattening" not in params:
++        return f"+a={params['semimajor_axis']!r} +b={params['semiminor_axis']!r}"
++    return f"+a={params['semimajor_axis']!r} +rf={params['inverse_flattening']!r}"
++
++
++def proj_string(ellipsoid: Any = "sphere", lon_0: float = 0.0) -> str:
++    """The PROJ string of the HEALPix projection on the given ellipsoid.
++
++    The ellipsoid parameters are taken from ``healpix-geo``, so PROJ and
++    ``healpix-geo`` use exactly the same figure of the Earth.
++    """
++    return f"+proj=healpix {_shape_params(ellipsoid)} +lon_0={float(lon_0)!r}"
++
++
++def geographic_proj_string(ellipsoid: Any = "sphere") -> str:
++    """The PROJ string of geographic (lon / lat) coordinates on the ellipsoid."""
++    return f"+proj=longlat {_shape_params(ellipsoid)}"
++
++
++def healpix_crs(ellipsoid: Any = "sphere", lon_0: float = 0.0) -> pyproj.CRS:
++    """``pyproj.CRS`` of the HEALPix projection on the given ellipsoid."""
++    import pyproj
++
++    return pyproj.CRS.from_proj4(proj_string(ellipsoid, lon_0))
++
++
++def geographic_crs(ellipsoid: Any = "sphere") -> pyproj.CRS:
++    """``pyproj.CRS`` of geographic coordinates on the given ellipsoid."""
++    import pyproj
++
++    return pyproj.CRS.from_proj4(geographic_proj_string(ellipsoid))
++
++
++def apply_transform(transform: Affine, cols, rows):
++    """Apply an affine transform to arrays of pixel coordinates."""
++    a, b, c, d, e, f, *_ = transform
++    cols = np.asarray(cols, dtype="float64")
++    rows = np.asarray(rows, dtype="float64")
++    return a * cols + b * rows + c, d * cols + e * rows + f
++
++
++def plane_half_width(crs: pyproj.CRS, lon_0: float = 0.0) -> float:
++    """Half the width of the HEALPix map (π times the authalic radius)."""
++    import pyproj
++
++    forward = pyproj.Transformer.from_crs(crs.geodetic_crs, crs, always_xy=True)
++    x, _ = forward.transform(lon_0 + 90.0, 0.0)
++    return 2.0 * float(x)
++
++
++def cell_aligned_grid(
++    healpix_grid: HealpixGrid,
++    cell_ids: np.ndarray | None = None,
++    *,
++    lon_0: float = 0.0,
++) -> AffineSamplingGrid:
++    """A sampling grid in ``+proj=healpix`` with exactly one pixel per cell.
++
++    The pixels are squares rotated by 45° that coincide with the HEALPix cells
++    of ``healpix_grid.level``, so resampling onto this grid is lossless. The
++    full grid covers the bounding box of the 12 base facets in the rotated
++    frame (``6 * nside`` pixels on each side, a third of which lie on the
++    globe); passing ``cell_ids`` crops it to the bounding box of those cells.
++
++    ``lon_0`` must be a multiple of 90° for the cells to line up with the
++    pixels, and ``level`` must be at least 1: in the rotated frame the polar
++    facets are offset from the equatorial ones by half a facet, so the base
++    cells themselves do not share a common pixel lattice.
++    """
++    from healpix_plot.sampling_grid import AffineSamplingGrid
++
++    if healpix_grid.level is None or healpix_grid.indexing_scheme == "zuniq":
++        raise ValueError("a cell-aligned grid needs a single resolution level")
++    if healpix_grid.level < 1:
++        raise ValueError(
++            "the base cells (level 0) do not align with a common pixel grid;"
++            " use level 1 or higher"
++        )
++    if lon_0 % 90 != 0:
++        raise ValueError(
++            f"lon_0 must be a multiple of 90° for the cells to align, got {lon_0}"
++        )
++
++    crs = healpix_crs(healpix_grid.ellipsoid, lon_0)
++    half_width = plane_half_width(crs, lon_0)
++    nside = 2**healpix_grid.level
++    # base facets are squares with a diagonal of a quarter of the map width
++    facet_half_diagonal = half_width / 4.0
++    cell_side = np.sqrt(2.0) * facet_half_diagonal / nside
++    k = cell_side / np.sqrt(2.0)
++    # columns run towards south-east, rows towards south-west; pixel (0, 0) is
++    # the north-eastern corner of the bounding box of the staircase of facets
++    transform = Affine(k, -k, 0.0, -k, -k, 1.5 * half_width)
++    shape = (6 * nside, 6 * nside)
++
++    grid = AffineSamplingGrid(transform, shape, crs)
++    if cell_ids is not None:
++        rows, cols = grid.pixel_indices(cell_ids, healpix_grid)
++        row0, col0 = int(rows.min()), int(cols.min())
++        shape = (int(rows.max()) - row0 + 1, int(cols.max()) - col0 + 1)
++        grid = AffineSamplingGrid(
++            transform @ Affine.translation(col0, row0), shape, crs
++        )
++
++    return grid
+diff --git a/healpix_plot/raster.py b/healpix_plot/raster.py
+new file mode 100644
+index 0000000..c17bb43
+--- /dev/null
++++ b/healpix_plot/raster.py
+@@ -0,0 +1,123 @@
++"""Bridge between resampled images and georeferenced rasters.
++
++These helpers wrap the result of :py:func:`healpix_plot.resample` into an
++:py:class:`xarray.DataArray` that ``rioxarray`` understands (and so can write
++to a GeoTIFF with ``.rio.to_raster()``), and decode the cell ids of an
++existing raster. Neither ``xarray`` nor ``rioxarray`` are hard dependencies;
++they are imported on use.
++"""
++
++from __future__ import annotations
++
++import json
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++
++from healpix_plot.projection import geographic_crs, resolve_ellipsoid
++from healpix_plot.sampling_grid import AffineSamplingGrid
++
++#: TIFF tag holding the CRS as WKT. GeoTIFF has no GeoKeys for the HEALPix
++#: projection, so GDAL keeps the CRS in a ``.aux.xml`` side-car file; the tag
++#: survives when the side-car is lost.
++CRS_TAG = "healpix_crs_wkt"
++
++if TYPE_CHECKING:
++    import xarray as xr
++
++    from healpix_plot.healpix import HealpixGrid
++    from healpix_plot.sampling_grid import ConcreteSamplingGrid
++
++
++def to_dataarray(
++    image: np.ndarray,
++    target_grid: ConcreteSamplingGrid,
++    healpix_grid: HealpixGrid,
++    *,
++    name: str | None = None,
++    attrs: dict[str, Any] | None = None,
++) -> xr.DataArray:
++    """Wrap a resampled image into a georeferenced :py:class:`xarray.DataArray`.
++
++    The result has ``y`` and ``x`` dimensions (plus ``band`` for RGB(A)
++    images). With ``rioxarray`` installed, the CRS and the affine transform are
++    written with the ``rio`` accessor, so ``result.rio.to_raster(path)``
++    produces a GeoTIFF; otherwise they are stored as the ``crs_wkt`` and
++    ``transform`` attributes.
++
++    The attributes (written as TIFF tags by rioxarray) also carry the CRS as
++    WKT (``healpix_crs_wkt``) and the grid parameters (``healpix_depth``,
++    ``healpix_indexing_scheme``, ``healpix_ellipsoid``): GeoTIFF cannot encode
++    the HEALPix projection in its GeoKeys, so GDAL stores the CRS in a
++    ``<file>.aux.xml`` side-car, and :py:meth:`AffineSamplingGrid.from_raster`
++    falls back to the tag when that side-car is missing.
++
++    Parameters
++    ----------
++    image : numpy.ndarray
++        The image returned by :py:func:`healpix_plot.resample`.
++    target_grid : ConcreteSamplingGrid
++        The resolved sampling grid returned together with the image.
++    healpix_grid : HealpixGrid
++        The source grid; its ellipsoid defines the geographic CRS of
++        unprojected sampling grids.
++    """
++    import xarray as xr
++
++    dims = ("y", "x") + (("band",) if image.ndim == 3 else ())
++    height, width = target_grid.shape[:2]
++    if target_grid.is_axis_aligned:
++        coords = {"x": target_grid.x[0, :], "y": target_grid.y[:, 0]}
++    else:
++        # rotated pixels have no 1D coordinates; the transform carries the geolocation
++        coords = {"x": np.arange(width), "y": np.arange(height)}
++
++    crs = target_grid.crs
++    if crs is None:
++        crs = geographic_crs(healpix_grid.ellipsoid)
++
++    ellipsoid = resolve_ellipsoid(healpix_grid.ellipsoid)
++    tags = {
++        CRS_TAG: crs.to_wkt(),
++        "healpix_depth": healpix_grid.level,
++        "healpix_indexing_scheme": healpix_grid.indexing_scheme,
++        "healpix_ellipsoid": ellipsoid.get("name")
++        or json.dumps({k: v for k, v in ellipsoid.items() if k != "name"}),
++    }
++    arr = xr.DataArray(
++        image, dims=dims, coords=coords, name=name, attrs={**tags, **(attrs or {})}
++    )
++
++    try:
++        import rioxarray  # noqa: F401
++    except ImportError:
++        arr.attrs["crs_wkt"] = crs.to_wkt()
++        if target_grid.transform is not None:
++            arr.attrs["transform"] = tuple(target_grid.transform)[:6]
++        return arr
++
++    arr = arr.rio.write_crs(crs)
++    if target_grid.transform is not None:
++        arr = arr.rio.write_transform(target_grid.transform)
++    return arr
++
++
++def raster_cell_ids(raster, healpix_grid: HealpixGrid) -> np.ma.MaskedArray:
++    """The cell id under each pixel centre of an existing raster.
++
++    Parameters
++    ----------
++    raster : rasterio dataset or xarray object with the ``rio`` accessor
++        See :py:meth:`AffineSamplingGrid.from_raster`.
++    healpix_grid : HealpixGrid
++        The grid to express the pixel positions in.
++
++    Returns
++    -------
++    cell_ids : numpy.ma.MaskedArray
++        One cell id per pixel; pixels off the globe are masked. For a raster
++        written on :py:meth:`AffineSamplingGrid.from_healpix`, this recovers
++        the original cell ids exactly.
++    """
++    grid = AffineSamplingGrid.from_raster(raster)
++    return grid.resolve(None, healpix_grid).cell_ids(healpix_grid)
+diff --git a/healpix_plot/resampling.py b/healpix_plot/resampling.py
+index 88a7329..201b4f3 100644
+--- a/healpix_plot/resampling.py
++++ b/healpix_plot/resampling.py
+@@ -29,13 +29,13 @@ def nearest_neighbour_resampling(
+     params: HealpixGrid,
+     background_value: float,
+ ) -> (np.ndarray, np.ndarray):
+-    target_cell_ids = params.operations.lonlat_to_healpix(
+-        np.reshape(target_grid.x, -1),
+-        np.reshape(target_grid.y, -1),
+-        **params.as_keyword_params(),
+-    )
++    # cell ids of the pixel centres; pixels off the globe (possible for
++    # projected grids) are masked and stay at the background value
++    target_cell_ids = target_grid.cell_ids(params)
++    flat_ids = np.reshape(np.ma.getdata(target_cell_ids), -1)
++    on_globe = ~np.reshape(np.ma.getmaskarray(target_cell_ids), -1)
+ 
+-    raw_shape = (target_cell_ids.size,)
++    raw_shape = (flat_ids.size,)
+     shape = target_grid.shape
+     if is_rgb(data):
+         raw_shape += data.shape[-1:]
+@@ -45,9 +45,8 @@ def nearest_neighbour_resampling(
+     #
+     # searchsorted(a, b) returns insert indices that insert a into b, not search
+     # values from a in b. We thus need to mask all target cell ids not in the source.
+-    valid = np.isin(target_cell_ids, source_cell_ids)
+-    indices = np.searchsorted(source_cell_ids, target_cell_ids, side="left")
+-    valid_indices = indices[valid]
++    valid = on_globe & np.isin(flat_ids, source_cell_ids)
++    valid_indices = np.searchsorted(source_cell_ids, flat_ids[valid], side="left")
+ 
+     # actual interpolation
+     image = np.full(raw_shape, fill_value=background_value)
+diff --git a/healpix_plot/sampling_grid.py b/healpix_plot/sampling_grid.py
+index 0ad414c..8f072a4 100644
+--- a/healpix_plot/sampling_grid.py
++++ b/healpix_plot/sampling_grid.py
+@@ -1,13 +1,16 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, TypedDict
++from functools import cached_property
++from typing import TYPE_CHECKING, Any, TypedDict
+ 
+ import numpy as np
+ from affine import Affine
+ 
++from healpix_plot.projection import apply_transform
++
+ if TYPE_CHECKING:
+-    from typing import Self
++    from typing import Literal, Self
+ 
+     from healpix_plot.healpix import HealpixGrid
+ 
+@@ -39,6 +42,17 @@ class SamplingGrid:
+         raise NotImplementedError
+ 
+ 
++def canonical_longitude(lon: np.ndarray) -> np.ndarray:
++    """Wrap longitudes to the half-open interval ``(-180, 180]``.
++
++    Both edges of the antimeridian are the same meridian; projections map
++    ``-180`` and ``180`` to opposite sides of the map, so a single
++    representation is needed to decide which side a point belongs to.
++    """
++    lon = (np.asarray(lon, dtype="float64") + 180.0) % 360.0 - 180.0
++    return np.where(lon <= -180.0, lon + 360.0, lon)
++
++
+ def crosses_prime_meridian(cell_ids, params):
+     # very coarse detection of prime meridian crossing
+     base_cells = cell_ids // 4**params.level
+@@ -154,67 +168,311 @@ class ParametrizedSamplingGrid:
+ 
+ @dataclass
+ class AffineSamplingGrid(SamplingGrid):
++    """A sampling grid defined like a raster: an affine transform and a shape.
++
++    Parameters
++    ----------
++    transform : affine.Affine
++        Maps pixel indices ``(col, row)`` to coordinates, following the GDAL /
++        rasterio convention: ``transform * (0, 0)`` is the outer corner of the
++        first pixel, and the centre of pixel ``(row, col)`` is at
++        ``transform * (col + 0.5, row + 0.5)``.
++    shape : tuple of int
++        ``(height, width)``, i.e. ``(rows, cols)``, like a raster.
++    crs : CRS-like, optional
++        The coordinate reference system of ``transform``, as anything accepted
++        by :py:meth:`pyproj.CRS.from_user_input` (a :py:class:`pyproj.CRS`, a
++        PROJ string, an EPSG code, a rasterio CRS ...). ``None`` means
++        geographic coordinates (longitude / latitude in degrees).
++
++    See Also
++    --------
++    AffineSamplingGrid.from_raster : the grid of an existing raster
++    AffineSamplingGrid.from_healpix : the lossless grid in ``+proj=healpix``
++    """
++
+     transform: Affine
+     shape: tuple[int, int]
++    crs: Any = None
++
++    def __post_init__(self):
++        if isinstance(self.shape, int):
++            self.shape = (self.shape, self.shape)
++        self.shape = tuple(int(size) for size in self.shape)
++
++        if self.crs is not None:
++            import pyproj
++
++            self.crs = pyproj.CRS.from_user_input(self.crs)
+ 
+     @classmethod
+     def from_transform(
+         cls,
+         transform: Affine,
+         shape: int | tuple[int, int],
++        crs: Any = None,
+     ) -> Self:
+-        if isinstance(shape, int):
+-            shape = (shape, shape)
++        return cls(transform, shape, crs)
+ 
+-        return cls(transform, shape)
++    @classmethod
++    def from_raster(cls, raster) -> Self:
++        """The sampling grid of an existing raster.
++
++        Parameters
++        ----------
++        raster : rasterio dataset or xarray object with the ``rio`` accessor
++            Anything with ``transform``, ``height``, ``width`` and ``crs``
++            attributes (an open :py:class:`rasterio.io.DatasetReader`), or an
++            :py:class:`xarray.DataArray` / :py:class:`xarray.Dataset` with the
++            ``rioxarray`` accessor. Without a CRS, the ``healpix_crs_wkt`` tag
++            written by :py:func:`healpix_plot.raster.to_dataarray` is used.
++        """
++        # GDAL cannot encode the HEALPix projection in GeoTIFF GeoKeys and keeps
++        # it in a side-car; fall back to the WKT tag written by `to_dataarray`
++        rio = getattr(raster, "rio", None)
++        if rio is not None:
++            crs = rio.crs or raster.attrs.get("healpix_crs_wkt")
++            return cls(rio.transform(), (rio.height, rio.width), crs)
++        crs = raster.crs or raster.tags().get("healpix_crs_wkt")
++        return cls(raster.transform, (raster.height, raster.width), crs)
++
++    @classmethod
++    def from_healpix(
++        cls,
++        healpix_grid: HealpixGrid,
++        cell_ids: np.ndarray | None = None,
++        *,
++        lon_0: float = 0.0,
++    ) -> Self:
++        """The grid in ``+proj=healpix`` with exactly one pixel per cell.
++
++        See :py:func:`healpix_plot.projection.cell_aligned_grid`.
++        """
++        from healpix_plot.projection import cell_aligned_grid
++
++        return cell_aligned_grid(healpix_grid, cell_ids, lon_0=lon_0)
+ 
+     @property
+-    def center_transform(self):
++    def corner_transform(self) -> Affine:
+         return self.transform
+ 
+     @property
+-    def corner_transform(self):
+-        return self.transform * Affine.translation(-0.5, -0.5)
++    def center_transform(self) -> Affine:
++        return self.transform @ Affine.translation(0.5, 0.5)
+ 
+-    def resolve(
+-        self, cell_ids: np.ndarray, parameters: HealpixGrid
+-    ) -> ConcreteSamplingGrid:
+-        pixel_x = np.arange(self.shape[0])
+-        pixel_y = np.arange(self.shape[1])
+-
+-        py, px = np.meshgrid(pixel_y, pixel_x)
++    @property
++    def is_geographic(self) -> bool:
++        return self.crs is None or self.crs.is_geographic
++
++    def pixel_indices(
++        self, cell_ids: np.ndarray, healpix_grid: HealpixGrid
++    ) -> tuple[np.ndarray, np.ndarray]:
++        """The ``(rows, cols)`` of the pixels containing the cell centres.
++
++        Indices may lie outside the grid; compare against ``shape`` to find
++        the cells that fall onto it.
++        """
++        lon, lat = healpix_grid.operations.healpix_to_lonlat(
++            np.asarray(cell_ids, dtype="uint64"), **healpix_grid.as_keyword_params()
++        )
++        lon = np.asarray(lon, dtype="float64")
++        lat = np.asarray(lat, dtype="float64")
++        if self.is_geographic:
++            x, y = lon, lat
++        else:
++            import pyproj
+ 
+-        x, y = self.center_transform * (px, py)
++            forward = pyproj.Transformer.from_crs(
++                self.crs.geodetic_crs, self.crs, always_xy=True
++            )
++            x, y = forward.transform(canonical_longitude(lon), lat)
+ 
+-        _, scale_x, _, _, _, scale_y = self.center_transform.to_gdal()
++        cols, rows = apply_transform(~self.transform, x, y)
++        return np.floor(rows).astype("int64"), np.floor(cols).astype("int64")
+ 
+-        (xmin, xmax), (ymin, ymax) = self.center_transform * (
+-            np.array([0, self.shape[0]]),
+-            np.array([0, self.shape[1]]),
++    def resolve(
++        self, cell_ids: np.ndarray, parameters: HealpixGrid
++    ) -> ConcreteSamplingGrid:
++        height, width = self.shape
++        rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
++        x, y = apply_transform(self.center_transform, cols, rows)
++
++        corner_x, corner_y = apply_transform(
++            self.corner_transform,
++            np.array([0, width, 0, width]),
++            np.array([0, 0, height, height]),
+         )
++        extent_x = (float(corner_x.min()), float(corner_x.max()))
++        extent_y = (float(corner_y.min()), float(corner_y.max()))
+ 
+-        if xmin <= 0 and xmax >= 0:
+-            x = (x + 180) % 360 - 180
+-
+-        extent_x = (float(xmin), float(xmax))
+-        extent_y = (float(ymin), float(ymax))
+-
+-        return ConcreteSamplingGrid(x, y, extent_x, extent_y)
++        return ConcreteSamplingGrid(
++            x, y, extent_x, extent_y, crs=self.crs, transform=self.transform
++        )
+ 
+ 
+ @dataclass
+ class ConcreteSamplingGrid:
++    """A resolved sampling grid: the coordinates of every pixel centre.
++
++    Parameters
++    ----------
++    x, y : numpy.ndarray
++        2D arrays (``rows``, ``cols``) of pixel centre coordinates in the units
++        of ``crs`` (degrees of longitude / latitude if ``crs`` is ``None``).
++    extent_x, extent_y : tuple of float
++        The outer edges (or bounding box) of the grid along each axis.
++    crs : pyproj.CRS, optional
++        The coordinate reference system of ``x`` and ``y``. ``None`` means
++        geographic coordinates.
++    transform : affine.Affine, optional
++        The (pixel corner) affine transform, if the grid was defined by one.
++    """
++
+     x: np.ndarray
+     y: np.ndarray
+ 
+     extent_x: tuple[float, float]
+     extent_y: tuple[float, float]
+ 
++    crs: Any = None
++    transform: Affine | None = None
++
+     @property
+     def shape(self):
+         return self.x.shape
+ 
++    @property
++    def is_geographic(self) -> bool:
++        return self.crs is None or self.crs.is_geographic
++
++    @property
++    def is_axis_aligned(self) -> bool:
++        """whether the pixel edges are parallel to the coordinate axes"""
++        return self.transform is None or (
++            self.transform.b == 0 and self.transform.d == 0
++        )
++
++    @property
++    def origin(self) -> Literal["lower", "upper"]:
++        """where row 0 sits, as the ``origin`` argument of ``imshow``"""
++        if self.transform is None or self.transform.e > 0:
++            return "lower"
++        return "upper"
++
+     @property
+     def extent(self):
+-        extent_x = tuple((x + 180) % 360 - 180 for x in self.extent_x)
+-        return extent_x + self.extent_y
++        """``(xmin, xmax, ymin, ymax)``, as the ``extent`` argument of ``imshow``"""
++        if self.transform is None:
++            extent_x = tuple((x + 180) % 360 - 180 for x in self.extent_x)
++        else:
++            extent_x = tuple(self.extent_x)
++        return extent_x + tuple(self.extent_y)
++
++    @cached_property
++    def _lonlat(self) -> tuple[np.ndarray, np.ndarray]:
++        if self.crs is None:
++            lon, lat = self.x, self.y
++            if self.transform is not None:
++                lon = (lon + 180) % 360 - 180
++            return lon, lat
++
++        import pyproj
++
++        inverse = pyproj.Transformer.from_crs(
++            self.crs, self.crs.geodetic_crs, always_xy=True
++        )
++        lon, lat = inverse.transform(self.x, self.y, errcheck=False)
++        return np.asarray(lon, dtype="float64"), np.asarray(lat, dtype="float64")
++
++    @property
++    def lon(self) -> np.ndarray:
++        """the longitude of the pixel centres (``inf`` off the globe)"""
++        return self._lonlat[0]
++
++    @property
++    def lat(self) -> np.ndarray:
++        """the latitude of the pixel centres (``inf`` off the globe)"""
++        return self._lonlat[1]
++
++    @property
++    def _pixel_scale(self) -> float:
++        """a typical pixel size, in the units of ``x`` and ``y``"""
++        if self.transform is not None:
++            a, b, _, d, e, *_ = self.transform
++            return float(max(abs(a), abs(b), abs(d), abs(e)))
++        height, width = self.shape
++        dx = float(np.abs(np.diff(self.x, axis=1)).mean()) if width > 1 else 0.0
++        dy = float(np.abs(np.diff(self.y, axis=0)).mean()) if height > 1 else 0.0
++        return max(dx, dy) or 1.0
++
++    @cached_property
++    def valid(self) -> np.ndarray:
++        """mask of the pixels whose centre is a (unique) point on the globe
++
++        Pixels of a projected grid can lie outside the projection's domain
++        (the inverse projection then returns ``inf``), and the two edges of a
++        seam (for instance the antimeridian of a cylindrical projection) map
++        to the same point on the globe. Only the pixels whose centre projects
++        back onto itself (with longitudes in ``(-180, 180]``) are valid, so
++        every point on the globe corresponds to at most one pixel.
++        """
++        lon, lat = self._lonlat
++        valid = np.isfinite(lon) & np.isfinite(lat) & (np.abs(lat) <= 90)
++        if self.is_geographic or not valid.any():
++            return valid
++
++        import pyproj
++
++        forward = pyproj.Transformer.from_crs(
++            self.crs.geodetic_crs, self.crs, always_xy=True
++        )
++        x, y = forward.transform(
++            canonical_longitude(lon[valid]), lat[valid], errcheck=False
++        )
++        tolerance = 1e-6 * self._pixel_scale
++        roundtrip = (np.abs(np.asarray(x) - self.x[valid]) <= tolerance) & (
++            np.abs(np.asarray(y) - self.y[valid]) <= tolerance
++        )
++        valid[valid] = roundtrip
++        return valid
++
++    def cell_ids(self, healpix_grid: HealpixGrid) -> np.ma.MaskedArray:
++        """The id of the cell containing each pixel centre.
++
++        Returns a masked array of ``shape``; pixels off the globe are masked.
++        """
++        lon, lat = self._lonlat
++        valid = self.valid
++
++        ids = np.zeros(self.shape, dtype="uint64")
++        if valid.any():
++            ids[valid] = healpix_grid.operations.lonlat_to_healpix(
++                np.ascontiguousarray(lon[valid]),
++                np.ascontiguousarray(lat[valid]),
++                **healpix_grid.as_keyword_params(),
++            )
++
++        return np.ma.MaskedArray(ids, mask=~valid)
++
++    def corners(self) -> tuple[np.ndarray, np.ndarray]:
++        """The coordinates of the pixel corners, as ``(rows + 1, cols + 1)`` arrays.
++
++        Suitable for ``pcolormesh(..., shading="flat")``.
++        """
++        height, width = self.shape
++        if self.transform is not None:
++            rows, cols = np.meshgrid(
++                np.arange(height + 1), np.arange(width + 1), indexing="ij"
++            )
++            return apply_transform(self.transform, cols, rows)
++
++        xs = self.x[0, :]
++        ys = self.y[:, 0]
++
++        def edges(centers):
++            inner = (centers[1:] + centers[:-1]) / 2
++            first = centers[0] - (inner[0] - centers[0])
++            last = centers[-1] + (centers[-1] - inner[-1])
++            return np.concatenate([[first], inner, [last]])
++
++        return np.meshgrid(edges(xs), edges(ys))
+diff --git a/healpix_plot/tests/test_plotting.py b/healpix_plot/tests/test_plotting.py
+new file mode 100644
+index 0000000..1e88bc9
+--- /dev/null
++++ b/healpix_plot/tests/test_plotting.py
+@@ -0,0 +1,109 @@
++import matplotlib
++
++matplotlib.use("Agg")
++
++import cartopy.crs as ccrs  # noqa: E402
++import matplotlib.pyplot as plt  # noqa: E402
++import numpy as np  # noqa: E402
++import pytest  # noqa: E402
++from affine import Affine  # noqa: E402
++
++from healpix_plot import HEALPix, HealpixGrid, plot  # noqa: E402
++from healpix_plot.sampling_grid import AffineSamplingGrid  # noqa: E402
++
++
++@pytest.fixture
++def healpix_data():
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="nested", ellipsoid="WGS84")
++    cell_ids = np.arange(12 * 4**2, dtype="uint64")
++    lon, lat = healpix_grid.operations.healpix_to_lonlat(
++        cell_ids, **healpix_grid.as_keyword_params()
++    )
++    data = np.cos(np.deg2rad(lon)) * np.sin(np.deg2rad(lat))
++    return healpix_grid, cell_ids, data
++
++
++@pytest.fixture(autouse=True)
++def close_figures():
++    yield
++    plt.close("all")
++
++
++class TestHEALPix:
++    def test_outline(self):
++        projection = HEALPix(ellipsoid="WGS84")
++        xmin, xmax = projection.x_limits
++        ymin, ymax = projection.y_limits
++        assert xmax == pytest.approx(-xmin)
++        assert ymax == pytest.approx(-ymin)
++        assert xmax == pytest.approx(2 * ymax)
++        assert projection.boundary.is_ring
++
++    def test_matches_grid_crs(self):
++        pytest.importorskip("pyproj")
++        from healpix_plot.projection import healpix_crs
++
++        assert HEALPix(ellipsoid="WGS84") == ccrs.Projection(healpix_crs("WGS84"))
++        assert HEALPix(ellipsoid="sphere") != ccrs.Projection(healpix_crs("WGS84"))
++
++
++def test_plot_geographic_grid(healpix_data):
++    healpix_grid, cell_ids, data = healpix_data
++
++    mappable = plot(
++        cell_ids, data, healpix_grid=healpix_grid, sampling_grid={"shape": 64}
++    )
++    assert isinstance(mappable, matplotlib.image.AxesImage)
++
++
++def test_plot_projected_axis_aligned_grid(healpix_data):
++    pytest.importorskip("pyproj")
++    healpix_grid, cell_ids, data = healpix_data
++
++    grid = AffineSamplingGrid(
++        Affine(200_000, 0, -6_000_000, 0, -200_000, 6_000_000),
++        (60, 60),
++        crs="EPSG:3857",
++    )
++    # on axes in a different projection, cartopy re-projects the image
++    mappable = plot(
++        cell_ids,
++        data,
++        healpix_grid=healpix_grid,
++        sampling_grid=grid,
++        projection="Mercator",
++    )
++    assert isinstance(mappable, matplotlib.image.AxesImage)
++
++    # on axes in the grid's own projection, the image is drawn as is
++    ax = plt.axes(projection=ccrs.Projection(grid.crs))
++    mappable = plot(
++        cell_ids, data, healpix_grid=healpix_grid, sampling_grid=grid, ax=ax
++    )
++    assert isinstance(mappable, matplotlib.image.AxesImage)
++    assert mappable.get_extent() == pytest.approx(grid.resolve(None, None).extent)
++
++
++@pytest.mark.parametrize("projection", ["HEALPix", "Mollweide"])
++def test_plot_cell_aligned_grid(healpix_data, projection):
++    pytest.importorskip("pyproj")
++    healpix_grid, cell_ids, data = healpix_data
++
++    grid = AffineSamplingGrid.from_healpix(healpix_grid)
++    mappable = plot(
++        cell_ids,
++        data,
++        healpix_grid=healpix_grid,
++        sampling_grid=grid,
++        projection=projection,
++    )
++    assert isinstance(mappable, matplotlib.collections.QuadMesh)
++    if projection == "HEALPix":
++        assert isinstance(mappable.axes.projection, HEALPix)
++        # drawn in data coordinates, without re-projection
++        np.testing.assert_allclose(
++            mappable.get_coordinates()[..., 0], grid.resolve(None, None).corners()[0]
++        )
++    # the whole globe is covered
++    mappable.axes.coastlines()
++    mappable.figure.canvas.draw()
+diff --git a/healpix_plot/tests/test_projection.py b/healpix_plot/tests/test_projection.py
+new file mode 100644
+index 0000000..c1453ab
+--- /dev/null
++++ b/healpix_plot/tests/test_projection.py
+@@ -0,0 +1,174 @@
++import numpy as np
++import pytest
++
++from healpix_plot import projection
++from healpix_plot.healpix import HealpixGrid
++from healpix_plot.resampling import resample
++from healpix_plot.sampling_grid import AffineSamplingGrid
++
++
++class TestResolveEllipsoid:
++    def test_names(self):
++        assert projection.resolve_ellipsoid("sphere") == {
++            "name": "sphere",
++            "radius": 6370997.0,
++        }
++        assert projection.resolve_ellipsoid(None) == projection.resolve_ellipsoid(
++            "sphere"
++        )
++        wgs84 = projection.resolve_ellipsoid("WGS84")
++        assert wgs84["semimajor_axis"] == 6378137.0
++        assert wgs84["inverse_flattening"] == pytest.approx(298.257223563)
++
++    def test_mappings_and_objects(self):
++        mapping = {"semimajor_axis": 1.0, "inverse_flattening": 300.0}
++        assert projection.resolve_ellipsoid(mapping) == mapping
++
++        class Ellipsoid:
++            semimajor_axis = 2.0
++            inverse_flattening = 299.0
++
++        assert projection.resolve_ellipsoid(Ellipsoid()) == {
++            "semimajor_axis": 2.0,
++            "inverse_flattening": 299.0,
++        }
++
++        class Sphere:
++            radius = 3.0
++
++        assert projection.resolve_ellipsoid(Sphere()) == {"radius": 3.0}
++
++    def test_grid_like(self):
++        grid = HealpixGrid(level=1, indexing_scheme="nested", ellipsoid="WGS84")
++        assert projection.resolve_ellipsoid(grid) == projection.resolve_ellipsoid(
++            "WGS84"
++        )
++
++
++def test_proj_string():
++    assert projection.proj_string("sphere") == "+proj=healpix +R=6370997.0 +lon_0=0.0"
++    assert (
++        projection.proj_string("WGS84", lon_0=90)
++        == "+proj=healpix +a=6378137.0 +rf=298.257223563 +lon_0=90.0"
++    )
++    assert projection.geographic_proj_string("sphere") == "+proj=longlat +R=6370997.0"
++
++
++def test_crs():
++    pytest.importorskip("pyproj")
++
++    crs = projection.healpix_crs("WGS84")
++    assert crs.is_projected
++    assert crs.ellipsoid.semi_major_metre == 6378137.0
++
++    geographic = projection.geographic_crs("WGS84")
++    assert geographic.is_geographic
++    assert geographic.ellipsoid.semi_major_metre == 6378137.0
++
++    # the plane is 2πR wide, R being the authalic radius
++    half_width = projection.plane_half_width(crs)
++    assert half_width == pytest.approx(np.pi * 6371007.18, rel=1e-6)
++
++
++@pytest.mark.parametrize("ellipsoid", ["sphere", "WGS84"])
++@pytest.mark.parametrize("indexing_scheme", ["nested", "ring"])
++@pytest.mark.parametrize("level", [1, 2, 3, 4])
++def test_cell_aligned_grid_is_lossless(level, indexing_scheme, ellipsoid):
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(
++        level=level, indexing_scheme=indexing_scheme, ellipsoid=ellipsoid
++    )
++    nside = 2**level
++    npix = 12 * nside**2
++
++    grid = AffineSamplingGrid.from_healpix(healpix_grid)
++    assert grid.shape == (6 * nside, 6 * nside)
++    assert not grid.is_geographic
++
++    target = grid.resolve(None, healpix_grid)
++    assert not target.is_axis_aligned
++
++    # pixel -> cell: every cell is hit by exactly one pixel centre
++    ids = target.cell_ids(healpix_grid)
++    found = np.ma.compressed(ids)
++    assert found.size == npix
++    np.testing.assert_equal(np.sort(found), np.arange(npix))
++
++    # cell -> pixel agrees with pixel -> cell
++    rows, cols = grid.pixel_indices(np.arange(npix), healpix_grid)
++    assert np.all((rows >= 0) & (rows < grid.shape[0]))
++    assert np.all((cols >= 0) & (cols < grid.shape[1]))
++    np.testing.assert_equal(np.ma.getdata(ids)[rows, cols], np.arange(npix))
++
++
++def test_cell_aligned_grid_crop():
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=3, indexing_scheme="nested", ellipsoid="WGS84")
++    # the children of base cell 4 (equatorial, centred on lon 0)
++    cell_ids = np.arange(4 * 4**3, 5 * 4**3, dtype="uint64")
++
++    full = AffineSamplingGrid.from_healpix(healpix_grid)
++    grid = AffineSamplingGrid.from_healpix(healpix_grid, cell_ids)
++    assert grid.shape == (8, 8)
++    assert grid.shape < full.shape
++    assert grid.crs == full.crs
++
++    ids = grid.resolve(None, healpix_grid).cell_ids(healpix_grid)
++    np.testing.assert_equal(np.sort(np.ma.compressed(ids)), cell_ids)
++
++
++def test_cell_aligned_grid_lon_0():
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="nested", ellipsoid="sphere")
++
++    grid = AffineSamplingGrid.from_healpix(healpix_grid, lon_0=90)
++    ids = grid.resolve(None, healpix_grid).cell_ids(healpix_grid)
++    np.testing.assert_equal(np.sort(np.ma.compressed(ids)), np.arange(12 * 4**2))
++
++    with pytest.raises(ValueError, match="multiple of 90"):
++        AffineSamplingGrid.from_healpix(healpix_grid, lon_0=45)
++
++
++def test_cell_aligned_grid_requires_level_1():
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=0, indexing_scheme="nested", ellipsoid="sphere")
++    with pytest.raises(ValueError, match="level 1 or higher"):
++        AffineSamplingGrid.from_healpix(healpix_grid)
++
++
++def test_cell_aligned_grid_requires_single_level():
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="zuniq", ellipsoid="sphere")
++    with pytest.raises(ValueError, match="single resolution level"):
++        AffineSamplingGrid.from_healpix(healpix_grid)
++
++
++def test_resample_on_cell_aligned_grid_is_lossless():
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="nested", ellipsoid="WGS84")
++    npix = 12 * 4**2
++    cell_ids = np.arange(npix, dtype="uint64")
++    data = np.arange(npix, dtype="float64") * 10
++
++    grid = AffineSamplingGrid.from_healpix(healpix_grid)
++    target, image = resample(
++        cell_ids,
++        data,
++        sampling_grid=grid,
++        healpix_grid=healpix_grid,
++        interpolation="nearest",
++        agg="first",
++    )
++
++    assert image.shape == grid.shape
++    finite = np.isfinite(image)
++    assert finite.sum() == npix
++    np.testing.assert_equal(np.sort(image[finite]), data)
++    rows, cols = grid.pixel_indices(cell_ids, healpix_grid)
++    np.testing.assert_equal(image[rows, cols], data)
+diff --git a/healpix_plot/tests/test_raster.py b/healpix_plot/tests/test_raster.py
+new file mode 100644
+index 0000000..4634e98
+--- /dev/null
++++ b/healpix_plot/tests/test_raster.py
+@@ -0,0 +1,101 @@
++import numpy as np
++import pytest
++
++from healpix_plot.healpix import HealpixGrid
++from healpix_plot.raster import raster_cell_ids, to_dataarray
++from healpix_plot.resampling import resample
++from healpix_plot.sampling_grid import AffineSamplingGrid, ParametrizedSamplingGrid
++
++
++def test_to_dataarray_axis_aligned():
++    xr = pytest.importorskip("xarray")
++    pytest.importorskip("pyproj")
++
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="nested", ellipsoid="sphere")
++    cell_ids = np.arange(12 * 4**2, dtype="uint64")
++    data = np.ones(cell_ids.size)
++
++    grid = ParametrizedSamplingGrid.from_bbox((-20, -10, 20, 10), shape=(9, 5))
++    target, image = resample(
++        cell_ids,
++        data,
++        sampling_grid=grid,
++        healpix_grid=healpix_grid,
++        interpolation="nearest",
++        agg="first",
++    )
++    arr = to_dataarray(image, target, healpix_grid, name="ones")
++
++    assert isinstance(arr, xr.DataArray)
++    assert arr.dims == ("y", "x")
++    assert arr.name == "ones"
++    np.testing.assert_allclose(arr.x, np.linspace(-20, 20, 9))
++    np.testing.assert_allclose(arr.y, np.linspace(-10, 10, 5))
++
++    pytest.importorskip("rioxarray")
++    assert arr.rio.crs is not None
++    assert arr.rio.crs.is_geographic
++
++
++def test_geotiff_roundtrip(tmp_path):
++    pytest.importorskip("pyproj")
++    rasterio = pytest.importorskip("rasterio")
++    rioxarray = pytest.importorskip("rioxarray")
++    import pyproj
++
++    healpix_grid = HealpixGrid(level=2, indexing_scheme="nested", ellipsoid="WGS84")
++    npix = 12 * 4**2
++    cell_ids = np.arange(npix, dtype="uint64")
++    data = cell_ids.astype("float64")
++
++    grid = AffineSamplingGrid.from_healpix(healpix_grid)
++    target, image = resample(
++        cell_ids,
++        data,
++        sampling_grid=grid,
++        healpix_grid=healpix_grid,
++        interpolation="nearest",
++        agg="first",
++    )
++    arr = to_dataarray(image, target, healpix_grid, name="cell_ids")
++    assert arr.rio.crs == grid.crs
++    assert arr.rio.transform().almost_equals(grid.transform)
++
++    path = tmp_path / "healpix.tif"
++    arr.rio.write_nodata(np.nan, inplace=True)
++    arr.rio.to_raster(path)
++
++    # rasterio sees the same CRS and transform ...
++    with rasterio.open(path) as src:
++        assert pyproj.CRS.from_user_input(src.crs) == grid.crs
++        assert src.transform.almost_equals(grid.transform)
++        assert (src.height, src.width) == grid.shape
++        read = src.read(1)
++        ids = raster_cell_ids(src, healpix_grid)
++
++    # ... and the cell ids can be recovered from the pixel positions alone
++    valid = ~np.ma.getmaskarray(ids)
++    assert valid.sum() == npix
++    np.testing.assert_equal(np.isfinite(read), valid)
++    np.testing.assert_equal(read[valid].astype("uint64"), np.ma.getdata(ids)[valid])
++
++    # the same through rioxarray
++    reopened = rioxarray.open_rasterio(path).squeeze("band", drop=True)
++    ids2 = raster_cell_ids(reopened, healpix_grid)
++    np.testing.assert_equal(np.ma.getmaskarray(ids2), ~valid)
++    np.testing.assert_equal(np.ma.getdata(ids2)[valid], np.ma.getdata(ids)[valid])
++
++    # GeoTIFF has no GeoKeys for the HEALPix projection: GDAL stores the CRS in
++    # a side-car. Without it, the CRS is recovered from the WKT tag.
++    sidecar = path.with_name(path.name + ".aux.xml")
++    if sidecar.exists():
++        sidecar.unlink()
++    with rasterio.open(path) as src:
++        assert src.tags()["healpix_crs_wkt"]
++        assert src.tags()["healpix_depth"] == "2"
++        assert src.tags()["healpix_ellipsoid"] == "WGS84"
++        assert AffineSamplingGrid.from_raster(src).crs == grid.crs
++        ids3 = raster_cell_ids(src, healpix_grid)
++    np.testing.assert_equal(ids3, ids)
++    reopened = rioxarray.open_rasterio(path).squeeze("band", drop=True)
++    assert AffineSamplingGrid.from_raster(reopened).crs == grid.crs
+diff --git a/healpix_plot/tests/test_sampling_grid.py b/healpix_plot/tests/test_sampling_grid.py
+index 3ecf857..86a44a9 100644
+--- a/healpix_plot/tests/test_sampling_grid.py
++++ b/healpix_plot/tests/test_sampling_grid.py
+@@ -253,23 +253,140 @@ class TestAffineSamplingGrid:
+         actual = sg.AffineSamplingGrid.from_transform(transform, shape)
+         assert actual.transform == transform
+         assert actual.shape == expected_shape
++        assert actual.crs is None
++        assert actual.is_geographic
+ 
+     @pytest.mark.parametrize(
+-        ["transform", "shape", "expected"],
++        ["transform", "shape", "expected_x", "expected_y"],
+         (
+-            (Affine.translation(1, 1), (3, 3), np.mgrid[:3, :3].astype("float64") + 1),
+-            (
++            pytest.param(
++                Affine.translation(1, 1),
++                (3, 3),
++                np.broadcast_to(np.arange(3) + 1.5, (3, 3)),
++                np.broadcast_to((np.arange(3) + 1.5)[:, None], (3, 3)),
++                id="translation",
++            ),
++            pytest.param(
+                 Affine.scale(2, 1),
+                 (4, 5),
+-                np.mgrid[:4, :5].astype("float64") * np.array([2, 1])[:, None, None],
++                np.broadcast_to((np.arange(5) + 0.5) * 2, (4, 5)),
++                np.broadcast_to((np.arange(4) + 0.5)[:, None], (4, 5)),
++                id="scale",
++            ),
++            pytest.param(
++                Affine(0.5, 0, 10, 0, -0.5, 20),
++                (2, 3),
++                np.broadcast_to(np.array([10.25, 10.75, 11.25]), (2, 3)),
++                np.broadcast_to(np.array([[19.75], [19.25]]), (2, 3)),
++                id="north-up",
+             ),
+         ),
+     )
+-    def test_resolve(self, transform, shape, expected):
++    def test_resolve(self, transform, shape, expected_x, expected_y):
+         grid = sg.AffineSamplingGrid(transform, shape)
+ 
+         # the parameters are ignored
+         actual = grid.resolve(0, None)
+-        expected_x, expected_y = expected
+-        np.testing.assert_equal(actual.x, expected_x)
+-        np.testing.assert_equal(actual.y, expected_y)
++        assert actual.shape == shape
++        assert actual.is_axis_aligned
++        assert actual.crs is None
++        assert actual.transform == transform
++        np.testing.assert_allclose(actual.x, expected_x)
++        np.testing.assert_allclose(actual.y, expected_y)
++
++    def test_extent_and_origin(self):
++        north_up = sg.AffineSamplingGrid(Affine(0.5, 0, 10, 0, -0.5, 20), (2, 3))
++        actual = north_up.resolve(0, None)
++        assert actual.extent == (10, 11.5, 19, 20)
++        assert actual.origin == "upper"
++
++        south_up = sg.AffineSamplingGrid(Affine(1, 0, 0, 0, 1, 0), (2, 3))
++        actual = south_up.resolve(0, None)
++        assert actual.extent == (0, 3, 0, 2)
++        assert actual.origin == "lower"
++
++    def test_rotated(self):
++        transform = Affine.rotation(45) @ Affine.scale(2)
++        grid = sg.AffineSamplingGrid(transform, (3, 4))
++        actual = grid.resolve(0, None)
++
++        assert not actual.is_axis_aligned
++        corner_x, corner_y = actual.corners()
++        assert corner_x.shape == (4, 5)
++        assert corner_y.shape == (4, 5)
++        # the extent is the bounding box of the corners
++        assert actual.extent == pytest.approx(
++            (corner_x.min(), corner_x.max(), corner_y.min(), corner_y.max())
++        )
++
++    def test_projected_crs(self):
++        pyproj = pytest.importorskip("pyproj")
++
++        grid = sg.AffineSamplingGrid(
++            Affine(1000, 0, 0, 0, -1000, 2000), (2, 2), crs="EPSG:3857"
++        )
++        assert isinstance(grid.crs, pyproj.CRS)
++        assert not grid.is_geographic
++
++        actual = grid.resolve(0, None)
++        assert not actual.is_geographic
++        # pixel centres: x = 500, 1500; y = 1500, 500
++        expected_lon = np.degrees(np.array([500, 1500]) / 6378137)
++        np.testing.assert_allclose(actual.lon, np.broadcast_to(expected_lon, (2, 2)))
++        assert np.all(actual.lat[0, :] > actual.lat[1, :])
++        assert actual.valid.all()
++
++    def test_geographic_crs(self):
++        grid = sg.AffineSamplingGrid(Affine(1, 0, 0, 0, 1, 0), (2, 2), crs="EPSG:4326")
++        assert grid.is_geographic
++        actual = grid.resolve(0, None)
++        np.testing.assert_equal(actual.lon, actual.x)
++        np.testing.assert_equal(actual.lat, actual.y)
++
++    def test_pixel_indices(self):
++        healpix_grid = HealpixGrid(
++            level=1, indexing_scheme="nested", ellipsoid="sphere"
++        )
++        # 1° pixels, north-up, covering the globe
++        grid = sg.AffineSamplingGrid(Affine(1, 0, -180, 0, -1, 90), (180, 360))
++        cell_ids = np.arange(48, dtype="uint64")
++
++        rows, cols = grid.pixel_indices(cell_ids, healpix_grid)
++
++        lon, lat = healpix_grid.operations.healpix_to_lonlat(
++            cell_ids, **healpix_grid.as_keyword_params()
++        )
++        np.testing.assert_equal(rows, np.floor(90 - lat))
++        np.testing.assert_equal(cols, np.floor(lon + 180))
++
++    def test_from_raster(self, tmp_path):
++        rasterio = pytest.importorskip("rasterio")
++        pyproj = pytest.importorskip("pyproj")
++
++        transform = Affine(1000, 0, 0, 0, -1000, 2000)
++        path = tmp_path / "raster.tif"
++        with rasterio.open(
++            path,
++            "w",
++            driver="GTiff",
++            width=3,
++            height=2,
++            count=1,
++            dtype="float32",
++            crs="EPSG:3857",
++            transform=transform,
++        ) as dst:
++            dst.write(np.zeros((2, 3), dtype="float32"), 1)
++
++        with rasterio.open(path) as src:
++            grid = sg.AffineSamplingGrid.from_raster(src)
++        assert grid.transform == transform
++        assert grid.shape == (2, 3)
++        assert grid.crs == pyproj.CRS("EPSG:3857")
++
++        rioxarray = pytest.importorskip("rioxarray")
++        arr = rioxarray.open_rasterio(path)
++        grid = sg.AffineSamplingGrid.from_raster(arr)
++        assert grid.transform.almost_equals(transform)
++        assert grid.shape == (2, 3)
++        assert grid.crs == pyproj.CRS("EPSG:3857")
+-- 
+2.50.1 (Apple Git-155)
+

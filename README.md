@@ -196,6 +196,72 @@ it only chooses which equatorial base cell is split by the map edge (base cell
 6 for `lon_0=0`, base cell 7 for `lon_0=90`, ...). When rasterising data that
 crosses a seam, split the data at the seam instead.
 
+## Lossless GeoTIFF with healpix-plot (towards xdggs)
+
+![healpix-plot on the cell-aligned grid, and the GeoTIFF read back](docs/images/healpix_plot_geotiff.png)
+
+`scripts/healpix_geotiff.py` above builds the one-pixel-per-cell raster by
+hand with rasterio. For xdggs the same idea has to live in a library:
+[`patches/0001-healpix-plot-crs-sampling-grid.patch`](patches/0001-healpix-plot-crs-sampling-grid.patch)
+adds it to [healpix-plot](https://github.com/GRID4EARTH/healpix-plot), whose
+sampling grids already turn cell ids into regular rasters (it applies cleanly
+to commit `42a6d04`, August 2026):
+
+- `AffineSamplingGrid` takes a `crs` and follows the rasterio conventions
+  (corner transform, `(height, width)` shape); `from_raster()` takes the grid
+  of a rasterio dataset or a rioxarray `DataArray`.
+- `AffineSamplingGrid.from_healpix(healpix_grid)` builds the cell-aligned
+  grid in `+proj=healpix` (one pixel per cell, level ≥ 1, `lon_0` a multiple
+  of 90°). Resampling onto it is lossless.
+- `healpix_plot.raster.to_dataarray()` wraps the image into a georeferenced
+  `xarray.DataArray` (CRS and transform via rioxarray, so `.rio.to_raster()`
+  writes the GeoTIFF, plus the same `healpix_crs_wkt` / `healpix_depth` /
+  `healpix_ellipsoid` / `healpix_indexing_scheme` tags as
+  `scripts/healpix_geotiff.py`); `raster_cell_ids()` recovers the cell id
+  under every pixel of an existing raster.
+- `healpix_plot.HEALPix` is the cartopy projection from
+  `scripts/plot_healpix_cartopy.py`, and `plot(..., projection="HEALPix")`
+  draws the rotated grid undistorted.
+
+```bash
+cd ../healpix-plot && git apply ../healpix_proj/patches/0001-healpix-plot-crs-sampling-grid.patch
+```
+
+`scripts/healpix_geotiff_roundtrip.py` runs the whole path (needs the
+patched healpix-plot, rasterio and rioxarray): resample a field onto the
+cell-aligned grid, write it with rioxarray, read it back with rasterio,
+recover the cell ids from the pixel positions alone, and compare.
+
+```bash
+python scripts/healpix_geotiff_roundtrip.py --level 5 --ellipsoid WGS84 --figure docs/images/healpix_plot_geotiff.png
+```
+
+Checked at levels 5 and 8 on WGS84: the CRS, transform and shape survive the
+GeoTIFF, every cell is exactly one pixel, pixels off the globe are nodata, and
+every value is recovered exactly. Level 8 (786 432 cells, a 1536 × 1536
+raster) takes about 0.3 s to write and 0.2 s to read and decode.
+
+What this means for the plumbing:
+
+- **rasterio and rioxarray can be reused as they are**, with the side-car
+  caveat from the previous section: the rotated transform goes into the
+  GeoTIFF, but the CRS only into `<file>.tif.aux.xml`. `to_dataarray()`
+  therefore writes the CRS as WKT into the TIFF tags as well, and
+  `from_raster()` / `raster_cell_ids()` fall back to that tag (tested with the
+  side-car deleted). rioxarray only warns that it cannot derive 1D `x`/`y`
+  coordinates for a rotated raster, which is expected.
+- **xdggs does not need a rasterio dependency.** A `to_raster()`-style method
+  can return the `DataArray` from `to_dataarray()` and leave the writing to
+  rioxarray; the reverse direction is `raster_cell_ids()` followed by the
+  usual xdggs decoding. The resampling itself stays in healpix-plot.
+- **Known limits.** No EPSG code and no GeoKeys (see
+  [docs/standardisation.md](docs/standardisation.md)), so software outside
+  the GDAL/PROJ family may not read the CRS. Unlike `scripts/healpix_geotiff.py`,
+  the antimeridian is assigned to the `+180°` side only, so each cell is one
+  pixel but the left edge of the full map loses a sawtooth of half pixels
+  (visible in the figure). Interpolating across facet seams in this projection
+  is wrong, as the projection is interrupted there.
+
 ## Repository layout
 
 ```
